@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -157,7 +157,8 @@ internal static class TouchpadHelper {
         return RegisterRawInputDevices(new[]{ device }, 1, (uint) Marshal.SizeOf<RAWINPUTDEVICE>());
     }
 
-    public static (IntPtr, List<TouchpadContact>, uint) ParseInput(IntPtr lParam){
+    public static List<(IntPtr device, List<TouchpadContact> contacts, uint count)> ParseInput(IntPtr lParam){
+        var reports = new List<(IntPtr, List<TouchpadContact>, uint)>();
         // Get RAWINPUT.
         uint rawInputSize = 0;
         var rawInputHeaderSize = (uint) Marshal.SizeOf<RAWINPUTHEADER>();
@@ -169,7 +170,7 @@ internal static class TouchpadHelper {
                IntPtr.Zero,
                ref rawInputSize,
                rawInputHeaderSize) != 0)
-            return (currentDevice, null, 0);
+            return reports;
 
         RAWINPUT rawInput;
         byte[] rawHidRawData;
@@ -184,7 +185,7 @@ internal static class TouchpadHelper {
                    rawInputPointer,
                    ref rawInputSize,
                    rawInputHeaderSize) != rawInputSize)
-                return (currentDevice, null, 0);
+                return reports;
 
             rawInput = Marshal.PtrToStructure<RAWINPUT>(rawInputPointer);
 
@@ -194,7 +195,11 @@ internal static class TouchpadHelper {
             Marshal.Copy(rawInputPointer, rawInputData, 0, rawInputData.Length);
 
             rawHidRawData = new byte[rawInput.Hid.dwSizeHid * rawInput.Hid.dwCount];
-            var rawInputOffset = (int) rawInputSize - rawHidRawData.Length;
+            // RAWHID data begins after the RAWINPUTHEADER and two DWORDs,
+            // regardless of trailing allocation/alignment padding.
+            var rawInputOffset = checked((int)rawInputHeaderSize + 8);
+            if(rawInput.Hid.dwSizeHid == 0 || rawInputOffset + rawHidRawData.Length > rawInputData.Length)
+                return reports;
             Buffer.BlockCopy(rawInputData, rawInputOffset, rawHidRawData, 0, rawHidRawData.Length);
         } finally{
             Marshal.FreeHGlobal(rawInputPointer);
@@ -213,7 +218,7 @@ internal static class TouchpadHelper {
                    RIDI_PREPARSEDDATA,
                    IntPtr.Zero,
                    ref preparsedDataSize) != 0)
-                return (currentDevice, null, 0);
+                return reports;
             
             
             preparsedDataPointer = Marshal.AllocHGlobal((int) preparsedDataSize);
@@ -223,12 +228,12 @@ internal static class TouchpadHelper {
                    RIDI_PREPARSEDDATA,
                    preparsedDataPointer,
                    ref preparsedDataSize) != preparsedDataSize)
-                return (currentDevice,null, 0);
+                return reports;
 
             if(HidP_GetCaps(
                    preparsedDataPointer,
                    out var caps) != HIDP_STATUS_SUCCESS)
-                return (currentDevice,null, 0);
+                return reports;
 
             var valueCapsLength = caps.NumberInputValueCaps;
             var valueCaps = new HIDP_VALUE_CAPS[valueCapsLength];
@@ -238,100 +243,20 @@ internal static class TouchpadHelper {
                    valueCaps,
                    ref valueCapsLength,
                    preparsedDataPointer) != HIDP_STATUS_SUCCESS)
-                return (currentDevice,null, 0);
+                return reports;
 
-            uint scanTime = 0;
-            uint contactCount = 99;
-
-            List<TouchpadContactCreator> creators = new();
-            List<TouchpadContact> contacts = new();
-
-            // Iterating though each value (scanTime, contactCount, contactId, x, y)
-            // Sometimes, iterates also through contacts by looping these values for each contact
-            String toLog = "Parsing RawInput: ";
-            foreach(var valueCap in valueCaps.OrderBy(x => x.LinkCollection)){
-                toLog += "| ";
-                // In case this valueCap contains multiple contacts at a time (rawInput.Hid.dwCount), iterates over each contact
-                for(int contactIndex = 0; contactIndex < rawInput.Hid.dwCount; contactIndex++){
-                    toLog += contactIndex + ": ";
-                    IntPtr rawHidRawDataPointerAdjusted = IntPtr.Add(rawHidRawDataPointer,
-                        (int) (rawInput.Hid.dwSizeHid * contactIndex));
-
-                    if(HidP_GetUsageValue(
-                           HIDP_REPORT_TYPE.HidP_Input,
-                           valueCap.UsagePage,
-                           valueCap.LinkCollection,
-                           valueCap.Usage,
-                           out var value,
-                           preparsedDataPointer,
-                           rawHidRawDataPointerAdjusted,
-                           (uint) rawHidRawData.Length) != HIDP_STATUS_SUCCESS)
-                        continue;
-
-                    // Usage Page and ID in Windows Precision Touchpad input reports
-                    // https://docs.microsoft.com/en-us/windows-hardware/design/component-guidelines/windows-precision-touchpad-required-hid-top-level-collections#windows-precision-touchpad-input-reports
-                    switch(valueCap.LinkCollection){
-                        case 0:
-                            switch (valueCap.UsagePage, valueCap.Usage){
-                                case (0x0D, 0x56): // Scan Time
-                                    toLog += $"sT{value} ";
-                                    scanTime = value;
-                                    break;
-
-                                case (0x0D, 0x54): // Contact Count
-                                    toLog += $"cC{value} ";
-                                    contactCount = value;
-                                    break;
-                                default:
-                                    toLog += $"0U{valueCap.UsagePage}/{valueCap.Usage} ";
-                                    break;
-                            }
-
-                            break;
-
-                        default:
-                            while(creators.Count <= contactIndex){
-                                creators.Add(new TouchpadContactCreator());
-                            }
-
-                            switch (valueCap.UsagePage, valueCap.Usage){
-                                case (0x0D, 0x51): // Contact ID
-                                    toLog += $"ID{(int) value} ";
-                                    creators[contactIndex].ContactId = (int) value;
-                                    break;
-
-                                case (0x01, 0x30): // X
-                                    toLog += "X ";
-                                    creators[contactIndex].X = (int) value;
-                                    break;
-
-                                case (0x01, 0x31): // Y
-                                    toLog += "Y ";
-                                    creators[contactIndex].Y = (int) value;
-                                    break;
-                                default:
-                                    toLog += $"U{valueCap.UsagePage}/{valueCap.Usage} ";
-                                    break;
-                            }
-
-                            break;
-                    }
-                }
-
-                creators.ForEach(creator => {
-                    if((contactCount == 0 || contacts.Count < contactCount) && creator.TryCreate(out var contact)){
-                        contacts.Add(contact);
-                        creator.Clear();
-                    }
-                });
-                if(contactCount != 0 && contacts.Count >= contactCount){
-                    break;
-                }
+            var capabilities = valueCaps.Select(c => new HidValueCapability(c.UsagePage, c.LinkCollection, c.Usage));
+            bool ReadValue(HidValueCapability cap, int reportIndex, uint reportLength, out uint value) {
+                var report = IntPtr.Add(rawHidRawDataPointer, checked((int)(rawInput.Hid.dwSizeHid * reportIndex)));
+                var status = HidP_GetUsageValue(HIDP_REPORT_TYPE.HidP_Input, cap.Page, cap.Collection,
+                    cap.Usage, out value, preparsedDataPointer, report, reportLength);
+                if(status != HIDP_STATUS_SUCCESS && status != 0xC011000A && status != 0xC0110004)
+                    Logger.Log($"HID read error 0x{status:X8}, report={reportIndex}, bytes={reportLength}, usage={cap.Page}/{cap.Usage}, collection={cap.Collection}");
+                return status == HIDP_STATUS_SUCCESS;
             }
-
-            Logger.Log(toLog);
-
-            return (currentDevice, contacts, contactCount);
+            foreach(var (contacts, count) in HidReportDecoder.Decode(rawInput.Hid.dwCount, rawInput.Hid.dwSizeHid, capabilities, ReadValue))
+                reports.Add((currentDevice, contacts, count));
+            return reports;
         } finally{
             Marshal.FreeHGlobal(rawHidRawDataPointer);
             Marshal.FreeHGlobal(preparsedDataPointer);

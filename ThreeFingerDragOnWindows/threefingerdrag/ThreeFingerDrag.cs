@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Timers;
@@ -8,12 +8,14 @@ using ThreeFingerDragOnWindows.utils;
 
 namespace ThreeFingerDragOnWindows.threefingerdrag;
 
-public class ThreeFingerDrag{
+public class ThreeFingerDrag : IDisposable{
+    private readonly object _sync = new();
+    private bool _disposed;
     public const int RELEASE_FINGERS_THRESHOLD_MS = 40; // Windows Precision Touchpad sends contacts about every 10ms
 
     private readonly DistanceManager _distanceManager = new();
     private readonly FingerCounter _fingerCounter = new();
-    private readonly Timer _dragEndTimer = new();
+    private readonly System.Timers.Timer _dragEndTimer = new();
     private bool _isDragging;
 
     public ThreeFingerDrag(){
@@ -26,6 +28,12 @@ public class ThreeFingerDrag{
     private int _averagingCount = 0;
 
     public void OnTouchpadContact(IntPtr currentDevice, TouchpadContact[] oldContacts, TouchpadContact[] contacts, long elapsed){
+        lock(_sync){
+            if(!_disposed) ProcessContact(currentDevice, oldContacts, contacts, elapsed);
+        }
+    }
+
+    private void ProcessContact(IntPtr currentDevice, TouchpadContact[] oldContacts, TouchpadContact[] contacts, long elapsed){
         var deviceInfo = TouchpadHelper.GetDeivceInfo(currentDevice);
         bool hasFingersReleased = elapsed > RELEASE_FINGERS_THRESHOLD_MS;
         Logger.Log("TFD: " + string.Join(", ", oldContacts.Select(c => c.ToString())) + " | " +
@@ -47,6 +55,8 @@ public class ThreeFingerDrag{
             _isDragging = true;
             Logger.Log("    START DRAG, click down");
             MouseOperations.ThreeFingersDragMouseDown();
+            _dragEndTimer.Interval = GetReleaseDelay();
+            _dragEndTimer.Start();
         } else if(_isDragging &&
                   (shortDelayMovingFingersCount < 2 || (originalFingersCount != 3 && originalFingersCount >= 2))){
             // Stop dragging
@@ -88,10 +98,23 @@ public class ThreeFingerDrag{
     }
 
     private void OnTimerElapsed(object source, ElapsedEventArgs e){
+        lock(_sync){
+        if(_disposed) return;
         if(_isDragging){
             Logger.Log("    STOP DRAG FROM TIMER, Left click up");
             Logger.Log("");
             StopDrag();
+        }
+        }
+    }
+
+    public void Dispose(){
+        lock(_sync){
+            if(_disposed) return;
+            _disposed = true;
+            _dragEndTimer.Stop();
+            if(_isDragging) StopDrag();
+            _dragEndTimer.Dispose();
         }
     }
 
